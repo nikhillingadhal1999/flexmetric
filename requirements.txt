@@ -6,3 +6,6 @@ wheel
 twine
 flask
 psycopg2-binary
+clickhouse-connect
+ollama
+pytest

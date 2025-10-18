@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="flexmetric",
-    version="0.5.3",
+    version="0.5.5",
     author="Nikhil Lingadhal",
     description="A secure flexible Prometheus exporter for commands, databases, functions.",
     long_description=open("README.md").read(),
@@ -24,7 +24,8 @@ setup(
         "twine",
         "flask",
         "clickhouse-connect",
-        "psycopg2-binary"
+        "psycopg2-binary",
+        "ollama"
     ],
     entry_points={
         "console_scripts": [

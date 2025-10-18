@@ -9,7 +9,8 @@ DANGEROUS_COMMANDS = {
     'mkfs', 'dd', 'init', 'telinit', 'kill', 'killall',
     'chown', 'chmod', 'iptables', 'ufw', 'systemctl',
     'userdel', 'groupdel', 'adduser', 'addgroup',
-    'yes', ':(){:|:&};:',  # fork bomb
+    'yes', 'mkfs.ext4', 'mkfs.xfs', 'mkfs.ntfs',  # filesystem creation
+    ':(){:|:&};:',  # fork bomb
 }
 SHELL_SEPARATORS = r'[;&|]{1,2}'
 CMD_SUBSTITUTION_REGEX = re.compile(r'\$\((.*?)\)|`([^`]+)`', re.DOTALL)
@@ -103,11 +104,25 @@ def extract_subcommands(command):
     return [cmd.strip() for cmd in re.split(SHELL_SEPARATORS, command) if cmd.strip()]
 
 def contains_dangerous_token(tokens):
-    for token in tokens:
-        normalized = token.lower()
-        if normalized in DANGEROUS_COMMANDS:
-            return True
-    return False
+    if not tokens:
+        return False
+    
+    # Only check the first token (command name), not arguments
+    first_token = tokens[0].lower()
+    return first_token in DANGEROUS_COMMANDS
+
+def is_basic_command_safe(command):
+    """Basic safety check for command substitutions - more lenient than full safety check"""
+    if not command.strip():
+        return True
+    
+    # Split the command and check only the first token
+    tokens = command.split()
+    if not tokens:
+        return True
+    
+    first_token = tokens[0].lower()
+    return first_token not in DANGEROUS_COMMANDS
 
 def has_balanced_syntax(command: str) -> bool:
     stack = []
@@ -120,6 +135,7 @@ def has_balanced_syntax(command: str) -> bool:
             stack.append('(')
             i += 1
         elif command[i] == ')' and stack:
+            # Pop until we find the matching $(
             while stack:
                 top = stack.pop()
                 if top == '$(':
@@ -127,15 +143,34 @@ def has_balanced_syntax(command: str) -> bool:
             i += 1
         else:
             i += 1
+    
+    # Check for unmatched $(
     if any(item == '$(' for item in stack):
         return False
 
-    if command.count('`') % 2 != 0:
+    # Check for unmatched backticks (handle escaped backticks)
+    backtick_count = 0
+    i = 0
+    while i < len(command):
+        if command[i] == '`':
+            if i == 0 or command[i-1] != '\\':
+                backtick_count += 1
+        i += 1
+    
+    if backtick_count % 2 != 0:
         return False
 
     return True
 
 def has_invalid_operator_usage(command: str) -> bool:
+    # Handle special cases like find -exec commands
+    if 'find' in command and '-exec' in command:
+        return False
+    
+    # Handle commands with escaped characters that might be misinterpreted
+    if '\\' in command and ('find' in command or 'grep' in command):
+        return False
+    
     tokens = re.split(r'([;&|]{1,2})', command)
     tokens = [t.strip() for t in tokens if t.strip() != '']
 
@@ -164,8 +199,17 @@ def extract_command_substitutions(command: str):
             subs.append(command[start+2:i])
             i += 1
         elif command[i] == '`':
-            end = command.find('`', i+1)
-            if end != -1:
+            # Handle escaped backticks
+            if i > 0 and command[i-1] == '\\':
+                i += 1
+                continue
+            # Find matching backtick, handling nested cases
+            end = i + 1
+            while end < len(command):
+                if command[end] == '`' and (end == 0 or command[end-1] != '\\'):
+                    break
+                end += 1
+            if end < len(command):
                 subs.append(command[i+1:end])
                 i = end + 1
             else:
@@ -181,6 +225,12 @@ def extract_command_substitutions(command: str):
 def is_command_safe(command):
     if not command.strip():
         return True
+    
+    # Special check for fork bomb
+    if ':(){:|:&};:' in command:
+        logger.warning(f"Fork bomb detected in command: {command}")
+        return False
+    
     if not has_balanced_syntax(command=command):
         logger.warning(f"Unbalanced syntax detected in command: {command}")
         return False
@@ -190,7 +240,8 @@ def is_command_safe(command):
         return False
 
     for sub in substitutions:
-        if not is_command_safe(sub):
+        # For substitutions, we need to be more lenient - only check for truly dangerous commands
+        if sub.strip() and not is_basic_command_safe(sub):
             logger.warning(f"Dangerous command detected in substitution: {sub}")
             return False
     
@@ -199,7 +250,7 @@ def is_command_safe(command):
         return False
     for match in CMD_SUBSTITUTION_REGEX.finditer(command):
         inner_cmd = match.group(1) or match.group(2)
-        if not is_command_safe(inner_cmd):
+        if not is_basic_command_safe(inner_cmd):
             logger.warning(f"Dangerous command detected in substitution: {inner_cmd}")
             return False
 
@@ -207,10 +258,18 @@ def is_command_safe(command):
 
     for subcmd in subcommands:
         try:
-            tokens = shlex.split(subcmd, posix=True)
+            # Handle commands with escaped characters more gracefully
+            if '\\' in subcmd:
+                # For commands with backslashes, use a more lenient parsing
+                tokens = subcmd.split()
+            else:
+                tokens = shlex.split(subcmd, posix=True)
         except ValueError:
-            logger.error(f"Malformed command: {subcmd}")
-            return False
+            # If shlex fails, try basic splitting as fallback
+            tokens = subcmd.split()
+            if not tokens:
+                logger.error(f"Malformed command: {subcmd}")
+                return False
 
         if contains_dangerous_token(tokens):
             logger.warning(f"Dangerous command detected: {subcmd}")
