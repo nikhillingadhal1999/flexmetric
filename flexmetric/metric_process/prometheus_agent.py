@@ -218,7 +218,10 @@ def measure(args):
             # print(label_dict)
 
             try:
-                gauge.labels(**label_dict).set(convert_to_data_type(result["value"]))
+                if len(label_dict) > 0:
+                    gauge.labels(**label_dict).set(convert_to_data_type(result["value"]))
+                else:
+                    gauge.set(result["value"])
             except Exception as ex:
                 logger.error(f"Failed to set gauge for labels {label_dict}: {ex}")
 

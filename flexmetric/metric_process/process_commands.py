@@ -2,9 +2,19 @@ import subprocess
 import yaml
 import re
 from flexmetric.logging_module.logger import get_logger
+import re
+import shlex
+DANGEROUS_COMMANDS = {
+    'rm', 'reboot', 'shutdown', 'halt', 'poweroff',
+    'mkfs', 'dd', 'init', 'telinit', 'kill', 'killall',
+    'chown', 'chmod', 'iptables', 'ufw', 'systemctl',
+    'userdel', 'groupdel', 'adduser', 'addgroup',
+    'yes', ':(){:|:&};:',  # fork bomb
+}
+SHELL_SEPARATORS = r'[;&|]{1,2}'
+CMD_SUBSTITUTION_REGEX = re.compile(r'\$\((.*?)\)|`([^`]+)`', re.DOTALL)
 
 logger = get_logger(__name__)
-
 logger.info("prometheus is running") 
 
 def read_commands_from_yaml(file_path):
@@ -89,11 +99,123 @@ def process_single_command(cmd_info):
 
 
 
+def extract_subcommands(command):
+    return [cmd.strip() for cmd in re.split(SHELL_SEPARATORS, command) if cmd.strip()]
+
+def contains_dangerous_token(tokens):
+    for token in tokens:
+        normalized = token.lower()
+        if normalized in DANGEROUS_COMMANDS:
+            return True
+    return False
+
+def has_balanced_syntax(command: str) -> bool:
+    stack = []
+    i = 0
+    while i < len(command):
+        if command[i:i+2] == '$(':
+            stack.append('$(')
+            i += 2
+        elif command[i] == '(' and stack and stack[-1] == '$(':
+            stack.append('(')
+            i += 1
+        elif command[i] == ')' and stack:
+            while stack:
+                top = stack.pop()
+                if top == '$(':
+                    break
+            i += 1
+        else:
+            i += 1
+    if any(item == '$(' for item in stack):
+        return False
+
+    if command.count('`') % 2 != 0:
+        return False
+
+    return True
+
+def has_invalid_operator_usage(command: str) -> bool:
+    tokens = re.split(r'([;&|]{1,2})', command)
+    tokens = [t.strip() for t in tokens if t.strip() != '']
+
+    last_was_operator = True
+
+    for token in tokens:
+        if re.fullmatch(r'[;&|]{1,2}', token):
+            if last_was_operator:
+                return True
+            last_was_operator = True
+        else:
+            last_was_operator = False
+
+    return last_was_operator
+
+def extract_command_substitutions(command: str):
+    subs = []
+    stack = []
+    i = 0
+    while i < len(command):
+        if command[i:i+2] == '$(':
+            stack.append(i)
+            i += 2
+        elif command[i] == ')' and stack:
+            start = stack.pop()
+            subs.append(command[start+2:i])
+            i += 1
+        elif command[i] == '`':
+            end = command.find('`', i+1)
+            if end != -1:
+                subs.append(command[i+1:end])
+                i = end + 1
+            else:
+                return None
+        else:
+            i += 1
+
+    if stack:
+        return None 
+    return subs
+
+
 def is_command_safe(command):
-    blacklist = ['rm', 'reboot', 'shutdown', 'halt', 'poweroff', 'mkfs', 'dd']
-    for dangerous_cmd in blacklist:
-        if dangerous_cmd in command.split():
+    if not command.strip():
+        return True
+    if not has_balanced_syntax(command=command):
+        logger.warning(f"Unbalanced syntax detected in command: {command}")
+        return False
+    substitutions = extract_command_substitutions(command)
+    if substitutions is None:
+        logger.warning(f"Malformed command detected: {command}")
+        return False
+
+    for sub in substitutions:
+        if not is_command_safe(sub):
+            logger.warning(f"Dangerous command detected in substitution: {sub}")
             return False
+    
+    if has_invalid_operator_usage(command=command):
+        logger.warning(f"Invalid operator usage detected in command: {command}")
+        return False
+    for match in CMD_SUBSTITUTION_REGEX.finditer(command):
+        inner_cmd = match.group(1) or match.group(2)
+        if not is_command_safe(inner_cmd):
+            logger.warning(f"Dangerous command detected in substitution: {inner_cmd}")
+            return False
+
+    subcommands = extract_subcommands(command)
+
+    for subcmd in subcommands:
+        try:
+            tokens = shlex.split(subcmd, posix=True)
+        except ValueError:
+            logger.error(f"Malformed command: {subcmd}")
+            return False
+
+        if contains_dangerous_token(tokens):
+            logger.warning(f"Dangerous command detected: {subcmd}")
+            return False
+
     return True
 
 def process_commands(config_file):
